@@ -450,6 +450,140 @@ COMMANDS = {
 }
 
 
+
+
+# ──────────────────────────────────────────────
+# HTTP Server Mode
+# ──────────────────────────────────────────────
+
+
+def run_http_server(port=8099):
+    """Run polymarket-mcp as an HTTP server for curl/web/dashboard access.
+
+    Endpoints:
+      GET  /                    -> HTML status page
+      GET  /health              -> JSON health check
+      GET  /tools               -> List available tools
+      POST /call/{tool_name}    -> Call a tool with JSON body
+    """
+    import http.server
+    import socketserver
+    import urllib.parse
+
+    class MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            sys.stderr.write("[polymarket-http] %s\n" % (fmt % args))
+
+        def _send_json(self, data, status=200):
+            body = json.dumps(data, indent=2, default=str).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _call_tool(self, name, args):
+            if name not in COMMANDS:
+                return {"error": "Unknown tool: " + name}, 404
+            try:
+                result = COMMANDS[name](args)
+                return result, 200
+            except Exception as e:
+                return {"error": str(e)}, 500
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+
+            if path == "/health":
+                self._send_json({
+                    "status": "ok",
+                    "server": "polymarket-mcp",
+                    "version": VERSION,
+                    "tools": len(COMMANDS),
+                })
+            elif path == "/tools":
+                tools_info = tool_list_tools()
+                self._send_json({
+                    "tools": [
+                        {"name": n, "description": m["description"], "inputSchema": m["inputSchema"]}
+                        for n, m in tools_info.items()
+                    ]
+                })
+            elif path == "/":
+                tools_info = tool_list_tools()
+                rows = "".join(
+                    '<tr><td><code>' + n + '</code></td><td>' + m["description"] + '</td></tr>'
+                    for n, m in tools_info.items()
+                )
+                html = """<!DOCTYPE html>
+<html><head><title>Polymarket MCP Server</title><meta charset="utf-8">
+<style>
+body{font-family:system-ui,sans-serif;max-width:900px;margin:2em auto;padding:1em}
+h1{color:#2563eb}
+table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #d1d5db;padding:8px 12px;text-align:left}
+th{background:#f3f4f6}
+code{background:#f3f4f6;padding:2px 4px;border-radius:3px}
+pre{background:#1e293b;color:#e2e8f0;padding:1em;border-radius:6px;overflow-x:auto}
+</style></head><body>
+<h1>Polymarket MCP Server v""" + VERSION + """</h1>
+<p>Zero-dependency MCP + HTTP server for Polymarket prediction markets.
+<a href="/health">Health</a> | <a href="/tools">Tools JSON</a></p>
+<h2>Tools (""" + str(len(COMMANDS)) + """)</h2>
+<table><tr><th>Tool</th><th>Description</th></tr>"""
+                html += rows
+                html += """</table>
+<h2>Usage</h2>
+<pre># Health check
+curl http://localhost:""" + str(port) + """/health
+
+# List tools
+curl http://localhost:""" + str(port) + """/tools
+
+# Call a tool
+curl -X POST http://localhost:""" + str(port) + """/call/top_markets \\
+  -H 'Content-Type: application/json' \\
+  -d '{"limit":5}'
+</pre>
+</body></html>"""
+                body = html.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self._send_json({"error": "not found"}, 404)
+
+        def do_POST(self):
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path.rstrip("/")
+            content_length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            try:
+                args = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON"}, 400)
+                return
+            if path.startswith("/call/"):
+                name = path[6:]
+                result, status = self._call_tool(name, args)
+                self._send_json(result, status)
+            else:
+                self._send_json({"error": "not found"}, 404)
+
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("0.0.0.0", port), MCPHTTPHandler) as server:
+        sys.stderr.write("[polymarket-mcp] HTTP server on http://0.0.0.0:%d\n" % port)
+        sys.stderr.write("[polymarket-mcp] Endpoints: /health /tools /call/{tool_name}\n")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            sys.stderr.write("[polymarket-mcp] HTTP server stopped\n")
+
+
 def handle_request(request):
     """Handle a single JSON-RPC request."""
     req_id = request.get("id")
@@ -534,6 +668,23 @@ def main():
     if "--debug" in sys.argv:
         DEBUG = True
         sys.argv.remove("--debug")
+
+    if "--http" in sys.argv or "--port" in sys.argv:
+        port = 8099
+        if "--http" in sys.argv and len(sys.argv) > sys.argv.index("--http") + 1:
+            next_arg = sys.argv[sys.argv.index("--http") + 1]
+            if next_arg.lstrip("-").isdigit():
+                port = int(next_arg)
+                sys.argv.pop(sys.argv.index("--http") + 1)
+            sys.argv.remove("--http")
+        if "--port" in sys.argv and len(sys.argv) > sys.argv.index("--port") + 1:
+            next_arg = sys.argv[sys.argv.index("--port") + 1]
+            if next_arg.lstrip("-").isdigit():
+                port = int(next_arg)
+                sys.argv.pop(sys.argv.index("--port") + 1)
+            sys.argv.remove("--port")
+        run_http_server(port)
+        return
 
     if DEBUG:
         print("[polymarket-mcp] Starting MCP server (stdio transport)", file=sys.stderr)
