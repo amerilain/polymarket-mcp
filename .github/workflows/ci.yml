@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Run syntax check
+      run: |
+        python -m py_compile polymarket_mcp.py
+    - name: Validate version string
+      run: |
+        python -c "
+import ast, sys
+with open('polymarket_mcp.py') as f:
+    tree = ast.parse(f.read())
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == 'VERSION':
+                ver = node.value.value
+                parts = ver.split('.')
+                assert len(parts) == 3, f'Version must be semver, got {ver}'
+                print(f'Version OK: {ver}')
+        "
+    - name: Check unused imports
+      run: |
+        python -c "
+import ast, sys
+with open('polymarket_mcp.py') as f:
+    tree = ast.parse(f.read())
+imports = set()
+uses = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            imports.add(alias.name.split('.')[0])
+    elif isinstance(node, ast.ImportFrom):
+        if node.module:
+            imports.add(node.module.split('.')[0])
+    elif isinstance(node, ast.Name):
+        uses.add(node.id)
+unused = imports - uses - {'os', 'sys', 'json', 're', 'time', 'math'}
+if unused:
+    print(f'Potentially unused imports: {unused}')
+else:
+    print('No obviously unused imports found')
+        "
+    - name: Verify package build
+      run: |
+        pip install build
+        python -m build --sdist --wheel
